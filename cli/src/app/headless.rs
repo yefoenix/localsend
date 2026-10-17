@@ -11,18 +11,41 @@ use crate::sanitize;
 use crate::storage::Repository;
 use crate::ui::{Category, Ui};
 use crate::util;
-use localsend::discovery::{DiscoveryEvent, DiscoveryHandle};
+use localsend::discovery::{
+    ChannelStatus, DeviceChannel, DiscoveredDevice, DiscoveryEvent, DiscoveryHandle, HttpChannel,
+    StatefulDevice,
+};
+use localsend::http::client::v2::LsHttpClientV2;
+use localsend::http::dto_v2::RegisterDtoV2;
 use localsend::http::server::v2::{PrepareUploadDecisionV2, ServerEventV2};
+use localsend::model::discovery::{PROTOCOL_VERSION_V2, ProtocolType};
+use localsend::model::discovery::DeviceType;
+use localsend::multicast::DEFAULT_PORT;
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// How long a direct register probe may take before the destination is
+/// considered unreachable. LocalSend peers answer in milliseconds; anything
+/// slower is not worth waiting for in the agent fast path.
+const DIRECT_REGISTER_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(super) async fn run(
     mut storage: Repository,
     target: TargetSelector,
     payload: Payload,
 ) -> anyhow::Result<()> {
+    // Fast path: when the destination is a literal IP address, dial it
+    // directly. No server is started (so no local port is occupied and the
+    // GUI can keep owning 53317), and no discovery is needed (so the send
+    // starts immediately instead of after a network scan).
+    if let TargetSelector::Ip(ip) = &target {
+        return run_direct(storage, *ip, payload).await;
+    }
+
     let mut ui = Ui::new();
     let identity = storage.identity.clone();
     let (events_tx, mut events_rx) = mpsc::channel::<AppEvent>(64);
@@ -100,6 +123,123 @@ pub(super) async fn run(
     ui.set_status(None);
     stop_network(&server, Some(server_stop_tx), &discovery, discovery_stop_tx).await;
     result
+}
+
+/// Sends to a literal IP address without starting a local server or running
+/// discovery. This is the agent fast path: it occupies no local port, starts
+/// immediately, and works alongside a GUI instance that owns port 53317.
+async fn run_direct(
+    storage: Repository,
+    ip: IpAddr,
+    payload: Payload,
+) -> anyhow::Result<()> {
+    let identity = storage.identity.clone();
+    let port = DEFAULT_PORT;
+    let host = ip.to_string();
+
+    // Register with the destination over HTTPS. The register response carries
+    // the device's alias, version and certificate fingerprint, which is all
+    // the send task needs to address it.
+    let client = LsHttpClientV2::try_new(
+        &identity.key_pem,
+        &identity.cert_pem,
+        None,
+        Some(DIRECT_REGISTER_TIMEOUT),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?;
+
+    let response = client
+        .register(ProtocolType::Https, &host, port, register_dto(&identity))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Destination {host}:{port} was not reachable: {e}"
+            )
+        })?;
+
+    let fingerprint = response
+        .cert_fingerprint
+        .clone()
+        .unwrap_or_else(|| response.body.fingerprint.clone());
+    let channel = HttpChannel {
+        host: host.clone(),
+        port,
+        protocol: ProtocolType::Https,
+    };
+    let device = StatefulDevice {
+        device: DiscoveredDevice {
+            alias: response.body.alias.clone(),
+            version: response.body.version.clone(),
+            device_model: response.body.device_model.clone(),
+            device_type: response.body.device_type,
+            fingerprint,
+            channel: DeviceChannel::Http(channel.clone()),
+            download: response.body.download,
+        },
+        channels: HashMap::from([(DeviceChannel::Http(channel), ChannelStatus::Available)]),
+        logs: Vec::new(),
+    };
+
+    let mut ui = Ui::new();
+    let (events_tx, mut events_rx) = mpsc::channel::<AppEvent>(64);
+    ui.log_plain(&format!("Sending to {} ({host})...", sanitize::single_line(&response.body.alias)));
+
+    // Spawn the send task. The returned state is only used for progress
+    // rendering in the interactive flow; here the send runs in the background
+    // and reports through the event channel.
+    match payload {
+        Payload::Files(paths) => {
+            sending::spawn_send(
+                &mut ui,
+                identity,
+                device,
+                paths,
+                events_tx.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        Payload::Text(text) => {
+            sending::spawn_send_text(
+                &mut ui,
+                identity,
+                device,
+                text,
+                events_tx.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+    }
+
+    // Wait for the terminal event of the send task.
+    while let Some(event) = events_rx.recv().await {
+        match event {
+            AppEvent::SendEnded { success } => {
+                return if success {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Transfer failed"))
+                };
+            }
+            AppEvent::Log { category, text } => ui.log(category, &text),
+            _ => {}
+        }
+    }
+
+    Err(anyhow::anyhow!("Send task ended without a result"))
+}
+
+/// Builds this device's `register` payload for the direct fast path.
+fn register_dto(identity: &crate::storage::Identity) -> RegisterDtoV2 {
+    RegisterDtoV2 {
+        alias: identity.alias.clone(),
+        version: PROTOCOL_VERSION_V2.to_string(),
+        device_model: Some("CLI".to_string()),
+        device_type: Some(DeviceType::Headless),
+        fingerprint: identity.fingerprint.clone(),
+        port: identity.port,
+        protocol: ProtocolType::Https,
+        download: false,
+    }
 }
 
 /// Resolves the destination among the discovered devices and spawns the send

@@ -2,14 +2,15 @@ name: build-localsend-cli
 
 on:
   push:
-    paths:
-      - ".github/workflows/build-localsend-cli.yml"
+    branches:
+      - main
+      - "feature/**"
   workflow_dispatch:
     inputs:
       ref:
-        description: "localsend/localsend commit SHA or ref to build"
-        required: true
-        default: "d01fdb14c978fa8b2b13e29a50cc0feaefe5c1b9"
+        description: "Branch, tag or commit SHA to build"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -19,11 +20,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - name: Checkout localsend source (upstream, pinned SHA)
+      - name: Checkout localsend source
         uses: actions/checkout@v4
         with:
-          repository: localsend/localsend
-          ref: ${{ inputs.ref || 'd01fdb14c978fa8b2b13e29a50cc0feaefe5c1b9' }}
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 1
 
       - name: Install Rust 1.97.1 (rustup, minimal)
