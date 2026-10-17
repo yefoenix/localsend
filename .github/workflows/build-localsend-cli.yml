@@ -1,0 +1,48 @@
+name: build-localsend-cli
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-localsend-cli.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "localsend/localsend commit SHA or ref to build"
+        required: true
+        default: "d01fdb14c978fa8b2b13e29a50cc0feaefe5c1b9"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout localsend source (upstream, pinned SHA)
+        uses: actions/checkout@v4
+        with:
+          repository: localsend/localsend
+          ref: ${{ inputs.ref || 'd01fdb14c978fa8b2b13e29a50cc0feaefe5c1b9' }}
+          fetch-depth: 1
+
+      - name: Install Rust 1.97.1 (rustup, minimal)
+        shell: bash
+        run: |
+          where link || true
+          curl -sSfL -o rustup-init.exe https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+          ./rustup-init.exe -y --default-toolchain 1.97.1 --profile minimal --no-modify-path
+          echo "$USERPROFILE/.cargo/bin" >> "$GITHUB_PATH"
+          "$USERPROFILE/.cargo/bin/cargo" --version
+          "$USERPROFILE/.cargo/bin/rustc" --version
+
+      - name: Build localsend-cli (release, locked)
+        shell: bash
+        run: cargo build --release --locked --package localsend-cli
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: localsend-cli-windows-x86-64
+          path: target/release/localsend-cli.exe
+          if-no-files-found: error
