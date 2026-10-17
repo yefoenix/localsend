@@ -46,6 +46,13 @@ pub struct Args {
     #[arg(long, env = "LOCALSEND_DESTINATION")]
     pub destination: Option<PathBuf>,
 
+    /// Path to the GUI's device snapshot (devices.json). When set, `--to
+    /// <alias>` resolves the alias from this file instead of running the
+    /// CLI's own discovery. [default: probes the CLI executable's directory,
+    /// the GUI install dirs and the current directory]
+    #[arg(long, env = "LOCALSEND_GUI_DEVICES", value_name = "PATH")]
+    pub gui_devices: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -62,7 +69,7 @@ const HELP_SECTIONS: &str = "Events:\n  \
                              Y/N/P  Accept / Decline / Accept-and-Pair an incoming request\n  \
                              Ctrl+C Cancel the current transfer or request, or quit when idle\n \
                              \nEnvironment Variables:\n  \
-                             XDG_CONFIG_HOME, LOCALSEND_ALIAS, LOCALSEND_PORT, LOCALSEND_DESTINATION";
+                             XDG_CONFIG_HOME, LOCALSEND_ALIAS, LOCALSEND_PORT, LOCALSEND_DESTINATION, LOCALSEND_GUI_DEVICES";
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();

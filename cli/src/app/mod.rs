@@ -1,5 +1,6 @@
 mod devices;
 mod discovery;
+mod gui_devices;
 mod headless;
 mod keys;
 mod receive;
@@ -99,7 +100,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     let storage = storage::Repository::load(&args)?;
     match (target, payload) {
-        (Some(target), payload) => headless::run(storage, target, payload).await,
+        (Some(target), payload) => headless::run(storage, target, payload, args.gui_devices.clone()).await,
         (None, Payload::Files(preselected)) => run_interactive(storage, preselected).await,
         // clap only accepts `--text` together with `--to`.
         (None, Payload::Text(_)) => unreachable!("--text requires --to"),

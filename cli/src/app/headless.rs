@@ -3,6 +3,7 @@
 //! the network events a send needs are handled, and incoming transfer
 //! requests are declined.
 
+use super::gui_devices;
 use super::sending::{self, Payload, SendState};
 use super::status;
 use super::target::TargetSelector;
@@ -23,6 +24,7 @@ use localsend::model::discovery::DeviceType;
 use localsend::multicast::DEFAULT_PORT;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -37,13 +39,42 @@ pub(super) async fn run(
     mut storage: Repository,
     target: TargetSelector,
     payload: Payload,
+    gui_devices: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // Fast path: when the destination is a literal IP address, dial it
     // directly. No server is started (so no local port is occupied and the
     // GUI can keep owning 53317), and no discovery is needed (so the send
     // starts immediately instead of after a network scan).
     if let TargetSelector::Ip(ip) = &target {
-        return run_direct(storage, *ip, payload).await;
+        return run_direct(storage, *ip, DEFAULT_PORT, ProtocolType::Https, payload).await;
+    }
+
+    // GUI-assisted fast path: when the destination is an alias, try to
+    // resolve it from the GUI's device snapshot first. The GUI is the
+    // authority on where a device currently is: it discovers continuously
+    // while the CLI is not running, and re-confirms devices when they change
+    // their IP. Resolving from the snapshot lets the agent send immediately,
+    // without occupying a port or scanning the network.
+    if let TargetSelector::Alias(alias) = &target {
+        match gui_devices::resolve_alias(gui_devices.as_deref(), alias)? {
+            Some(resolved) => {
+                // The snapshot stores the host as an IP (or scoped IPv6).
+                // Parse it like the IP fast path does.
+                let host = resolved.channel.host.split('%').next().unwrap_or(&resolved.channel.host);
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    let protocol = match resolved.channel.protocol.as_str() {
+                        "http" => ProtocolType::Http,
+                        _ => ProtocolType::Https,
+                    };
+                    return run_direct(storage, ip, resolved.channel.port, protocol, payload).await;
+                }
+                // Non-IP hosts in the snapshot are unexpected; fall through to
+                // the CLI's own discovery below.
+            }
+            None => {
+                // No snapshot or unknown alias: fall back to discovery.
+            }
+        }
     }
 
     let mut ui = Ui::new();
@@ -131,10 +162,11 @@ pub(super) async fn run(
 async fn run_direct(
     storage: Repository,
     ip: IpAddr,
+    port: u16,
+    protocol: ProtocolType,
     payload: Payload,
 ) -> anyhow::Result<()> {
     let identity = storage.identity.clone();
-    let port = DEFAULT_PORT;
     let host = ip.to_string();
 
     // Register with the destination over HTTPS. The register response carries
@@ -149,7 +181,7 @@ async fn run_direct(
     .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?;
 
     let response = client
-        .register(ProtocolType::Https, &host, port, register_dto(&identity))
+        .register(protocol, &host, port, register_dto(&identity))
         .await
         .map_err(|e| {
             anyhow::anyhow!(
@@ -164,7 +196,7 @@ async fn run_direct(
     let channel = HttpChannel {
         host: host.clone(),
         port,
-        protocol: ProtocolType::Https,
+        protocol,
     };
     let device = StatefulDevice {
         device: DiscoveredDevice {

@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:localsend_isolates/constants.dart';
 import 'package:localsend_isolates/model/device.dart';
@@ -7,9 +9,15 @@ import 'package:localsend_isolates/rust/api/model.dart' as rust_model;
 import 'package:localsend_isolates/src/isolate/child/sync_provider.dart';
 import 'package:localsend_isolates/util/rust.dart';
 import 'package:logging/logging.dart';
+import 'package:path/path.dart' as path;
 import 'package:refena_flutter/refena_flutter.dart';
 
 final _logger = Logger('Discovery');
+
+/// File name of the device snapshot written next to the executable in
+/// portable mode. The CLI reads this file to resolve `--to <alias>` to the
+/// device's latest address without running its own discovery.
+const _devicesSnapshotFileName = 'devices.json';
 
 final discoveryProvider = Provider((ref) {
   return DiscoveryService(ref);
@@ -30,6 +38,12 @@ class DiscoveryService {
   /// Whether the current discovery was stopped by [restartListener], as
   /// opposed to stopping itself because the multicast sockets failed.
   bool _restartRequested = false;
+
+  /// The most recently confirmed state of every known device, keyed by
+  /// fingerprint. Kept in Dart (the Rust store has no full-list getter) and
+  /// mirrored to `devices.json` next to the executable on every change so
+  /// the CLI can resolve aliases to their latest addresses.
+  final Map<String, Device> _knownDevices = {};
 
   /// Starts the discovery and emits every device confirmation:
   /// answered announcements, scan results and devices fed in
@@ -101,7 +115,13 @@ class DiscoveryService {
 
       await for (final device in discovery.listen()) {
         if (!devices.isClosed) {
-          devices.add(device.toDevice());
+          final dartDevice = device.toDevice();
+          devices.add(dartDevice);
+          // Mirror the confirmed device to the snapshot file. A re-appearing
+          // device (same fingerprint, possibly new address) overwrites the
+          // previous entry, so the file always carries the latest address.
+          _knownDevices[dartDevice.fingerprint] = dartDevice;
+          unawaited(_persistSnapshot());
         }
       }
 
@@ -222,5 +242,88 @@ class DiscoveryService {
     }
 
     await discovery.addDevice(device: device.toRsDiscoveredDevice(ip));
+  }
+
+  /// Writes the current [devices.json] snapshot next to the executable
+  /// (portable mode) or into the platform's local app data directory.
+  ///
+  /// The file is consumed by the CLI's `--to <alias>` fast path. The format
+  /// is stable:
+  ///
+  /// ```json
+  /// {
+  ///   "version": 1,
+  ///   "devices": [
+  ///     {
+  ///       "alias": "Phone",
+  ///       "version": "1.18.2",
+  ///       "deviceModel": "Pixel",
+  ///       "deviceType": "mobile",
+  ///       "fingerprint": "...",
+  ///       "download": false,
+  ///       "channels": [
+  ///         { "host": "192.168.1.4", "port": 53317, "protocol": "https" }
+  ///       ]
+  ///     }
+  ///   ]
+  /// }
+  /// ```
+  Future<void> _persistSnapshot() async {
+    try {
+      final file = File(_snapshotPath());
+      final devices = [
+        for (final device in _knownDevices.values)
+          {
+            'alias': device.alias,
+            'version': device.version,
+            'deviceModel': device.deviceModel,
+            'deviceType': device.deviceType.name,
+            'fingerprint': device.fingerprint,
+            'download': device.download,
+            'channels': [
+              for (final channel in device.channels)
+                if (channel is HttpChannel)
+                  {
+                    'host': channel.host,
+                    'port': channel.port,
+                    'protocol': channel.https ? 'https' : 'http',
+                  },
+            ],
+          },
+      ];
+      await file.writeAsString(
+        const JsonEncoder.withIndent('  ').convert({
+          'version': 1,
+          'devices': devices,
+        }),
+      );
+    } catch (e) {
+      _logger.warning('Could not write devices snapshot', e);
+    }
+  }
+
+  /// The path of the device snapshot. In portable mode this is `devices.json`
+  /// next to the executable (where `settings.json` also lives); otherwise it
+  /// is `devices.json` in the platform's local application data directory.
+  String _snapshotPath() {
+    try {
+      final executable = Platform.resolvedExecutable;
+      if (executable.isNotEmpty) {
+        return path.join(File(executable).parent.path, _devicesSnapshotFileName);
+      }
+    } catch (_) {
+      // Fall through to the local app data directory.
+    }
+    // Non-portable installs (e.g. the MSIX package) write into the local
+    // application data directory; the CLI probes the same locations.
+    final base = Platform.isWindows
+        ? Platform.environment['LOCALAPPDATA']
+        : Platform.isMacOS
+            ? Directory.systemTemp.path
+            : Platform.environment['XDG_DATA_HOME'];
+    final dir = base == null || base.isEmpty
+        ? Directory.systemTemp.path
+        : base;
+    return path.join(dir, 'localsend_app', _devicesSnapshotFileName);
   }
 }
