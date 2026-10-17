@@ -52,6 +52,23 @@ jobs:
         working-directory: app
         run: flutter build windows
 
+      - name: Package portable build (Release directory)
+        shell: pwsh
+        run: |
+          $release = "app\build\windows\x64\runner\Release"
+          if (-not (Test-Path "$release\localsend_app.exe")) {
+            throw "Release output missing: $release"
+          }
+          Compress-Archive -Path "$release\*" -DestinationPath "$env:RUNNER_TEMP\localsend-windows-portable.zip" -CompressionLevel Optimal -Force
+          Get-Item "$env:RUNNER_TEMP\localsend-windows-portable.zip" | Select-Object FullName, Length
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v6
+        with:
+          name: localsend-windows-portable
+          path: ${{ runner.temp }}\localsend-windows-portable.zip
+          if-no-files-found: error
+
       - name: Prepare Inno Setup payload
         run: |
           New-Item -ItemType Directory -Force -Path "${{ runner.temp }}\inno" | Out-Null
